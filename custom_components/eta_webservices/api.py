@@ -5,7 +5,7 @@ from datetime import datetime
 import logging
 from typing import TypedDict
 
-from aiohttp import ClientSession
+from aiohttp import ClientError, ClientSession
 from packaging import version
 import xmltodict
 
@@ -18,6 +18,14 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class EtaApiError(Exception):
+    """Base error class for ETA API failures."""
+
+
+class EtaApiParseError(EtaApiError):
+    """Raised when ETA API responses cannot be parsed."""
 
 
 class ETAValidSwitchValues(TypedDict):
@@ -66,6 +74,9 @@ class EtaAPI:
         self._session: ClientSession = session
         self._host = host
         self._port = int(port)
+        self._request_timeout_seconds = 10
+        self._request_max_retries = 2
+        self._request_backoff_seconds = 0.5
         # 5 concurrent requests seem to be the sweetspot between speed and stability
         # More parallel requests are only very slightly faster (in the order of seconds), with the downside that the ETA user interface becomes very laggy
         self._max_concurrent_requests = 5
@@ -123,6 +134,27 @@ class EtaAPI:
     def _build_uri(self, suffix):
         return "http://" + self._host + ":" + str(self._port) + suffix
 
+    def _is_retryable_http_status(self, status_code: int) -> bool:
+        return status_code in (408, 425, 429, 500, 502, 503, 504)
+
+    def _parse_xml(self, text: str, context: str):
+        try:
+            return xmltodict.parse(text)
+        except Exception as err:  # noqa: BLE001
+            raise EtaApiParseError(
+                f"Invalid XML in ETA API response for {context}"
+            ) from err
+
+    def _extract_xml_path(self, xml_data: dict, path: list[str], context: str):
+        current_data = xml_data
+        for path_part in path:
+            if not isinstance(current_data, dict) or path_part not in current_data:
+                raise EtaApiParseError(
+                    f"Unexpected XML structure in ETA API response for {context}"
+                )
+            current_data = current_data[path_part]
+        return current_data
+
     def _evaluate_xml_dict(self, xml_dict, uri_dict, prefix=""):
         if isinstance(xml_dict, list):
             for child in xml_dict:
@@ -136,16 +168,51 @@ class EtaAPI:
         else:
             uri_dict[f"{prefix}_{xml_dict['@name']}"] = xml_dict["@uri"]
 
+    async def _request(self, method: str, suffix: str, data=None):
+        last_error = None
+        url = self._build_uri(suffix)
+
+        for attempt in range(self._request_max_retries + 1):
+            try:
+                response = await self._session.request(
+                    method,
+                    url,
+                    data=data,
+                    timeout=self._request_timeout_seconds,
+                )
+            except (ClientError, asyncio.TimeoutError) as err:
+                last_error = err
+            else:
+                if 200 <= response.status < 300:
+                    return response
+
+                response_text = await response.text()
+                response.release()
+                status_error = EtaApiError(
+                    f"{method} {suffix} returned status {response.status}: {response_text[:200]}"
+                )
+                if not self._is_retryable_http_status(response.status):
+                    raise status_error
+                last_error = status_error
+
+            if attempt < self._request_max_retries:
+                await asyncio.sleep(self._request_backoff_seconds * (attempt + 1))
+
+        raise EtaApiError(f"{method} {suffix} failed after retries") from last_error
+
     async def _get_request(self, suffix):
-        return await self._session.get(self._build_uri(suffix))
+        return await self._request("GET", suffix)
 
     async def _post_request(self, suffix, data):
-        return await self._session.post(self._build_uri(suffix), data=data)
+        return await self._request("POST", suffix, data=data)
 
     async def does_endpoint_exists(self):
         """Returns true if the ETA API is accessible."""
-        resp = await self._get_request("/user/menu")
-        return resp.status == 200
+        try:
+            await self._get_request("/user/menu")
+        except EtaApiError:
+            return False
+        return True
 
     async def get_api_version(self):
         """Get the version of the ETA API as a raw string.
@@ -153,9 +220,13 @@ class EtaAPI:
         :return: Version of the ETA API
         :rtype: Version
         """
-        data = await self._get_request("/user/api")
-        text = await data.text()
-        return version.parse(xmltodict.parse(text)["eta"]["api"]["@version"])
+        response = await self._get_request("/user/api")
+        text = await response.text()
+        parsed_data = self._parse_xml(text, "/user/api")
+        raw_version = self._extract_xml_path(
+            parsed_data, ["eta", "api", "@version"], "/user/api"
+        )
+        return version.parse(raw_version)
 
     async def is_correct_api_version(self):
         """Returns true if the ETA API version is v1.2 or higher."""
@@ -194,10 +265,15 @@ class EtaAPI:
         :return: Parsed data as a Tuple[Value, Unit]
         :rtype: Tuple[Any,str]
         """
-        data = await self._get_request("/user/var/" + str(uri))
-        text = await data.text()
-        data = xmltodict.parse(text)["eta"]["value"]
-        return self._parse_data(data, force_number_handling, force_string_handling)
+        response = await self._get_request("/user/var/" + str(uri))
+        text = await response.text()
+        parsed_data = self._parse_xml(text, f"/user/var/{uri}")
+        endpoint_data = self._extract_xml_path(
+            parsed_data, ["eta", "value"], f"/user/var/{uri}"
+        )
+        return self._parse_data(
+            endpoint_data, force_number_handling, force_string_handling
+        )
 
     async def get_all_data(self, sensor_list: dict[str, bool]):
         """Get all data from all endpoints.
@@ -229,17 +305,20 @@ class EtaAPI:
         return dict(zip(sensor_list.keys(), data_results, strict=False))
 
     async def _get_data_plus_raw(self, uri):
-        data = await self._get_request("/user/var/" + str(uri))
-        text = await data.text()
-        data = xmltodict.parse(text)["eta"]["value"]
-        value, unit = self._parse_data(data)
-        return value, unit, data
+        response = await self._get_request("/user/var/" + str(uri))
+        text = await response.text()
+        parsed_data = self._parse_xml(text, f"/user/var/{uri}")
+        endpoint_data = self._extract_xml_path(
+            parsed_data, ["eta", "value"], f"/user/var/{uri}"
+        )
+        value, unit = self._parse_data(endpoint_data)
+        return value, unit, endpoint_data
 
     async def get_menu(self):
         """Request the menu from the ETA API, which includes links to all possible sensors."""
-        data = await self._get_request("/user/menu")
-        text = await data.text()
-        return xmltodict.parse(text)
+        response = await self._get_request("/user/menu")
+        text = await response.text()
+        return self._parse_xml(text, "/user/menu")
 
     async def _get_raw_sensor_dict(self):
         data = await self.get_menu()
@@ -721,10 +800,13 @@ class EtaAPI:
         )
 
     async def _get_varinfo(self, fub, uri):
-        data = await self._get_request("/user/varinfo/" + str(uri))
-        text = await data.text()
-        data = xmltodict.parse(text)["eta"]["varInfo"]["variable"]
-        return self._parse_varinfo(data, fub, uri)
+        response = await self._get_request("/user/varinfo/" + str(uri))
+        text = await response.text()
+        parsed_data = self._parse_xml(text, f"/user/varinfo/{uri}")
+        variable_data = self._extract_xml_path(
+            parsed_data, ["eta", "varInfo", "variable"], f"/user/varinfo/{uri}"
+        )
+        return self._parse_varinfo(variable_data, fub, uri)
 
     def _parse_switch_state(self, data):
         return int(data["#text"])
@@ -736,10 +818,13 @@ class EtaAPI:
         :return: Raw switch value, like 1802
         :rtype: int
         """
-        data = await self._get_request("/user/var/" + str(uri))
-        text = await data.text()
-        data = xmltodict.parse(text)["eta"]["value"]
-        return self._parse_switch_state(data)
+        response = await self._get_request("/user/var/" + str(uri))
+        text = await response.text()
+        parsed_data = self._parse_xml(text, f"/user/var/{uri}")
+        value_data = self._extract_xml_path(
+            parsed_data, ["eta", "value"], f"/user/var/{uri}"
+        )
+        return self._parse_switch_state(value_data)
 
     async def set_switch_state(self, uri, state):
         """Set the state of a switch sensor.
@@ -751,9 +836,10 @@ class EtaAPI:
         """
         payload = {"value": state}
         uri = "/user/var/" + str(uri)
-        data = await self._post_request(uri, payload)
-        text = await data.text()
-        data = xmltodict.parse(text)["eta"]
+        response = await self._post_request(uri, payload)
+        text = await response.text()
+        parsed_data = self._parse_xml(text, uri)
+        data = self._extract_xml_path(parsed_data, ["eta"], uri)
         if "success" in data:
             return True
 
@@ -780,9 +866,10 @@ class EtaAPI:
             payload["begin"] = begin
             payload["end"] = end
         uri = "/user/var/" + str(uri)
-        data = await self._post_request(uri, payload)
-        text = await data.text()
-        data = xmltodict.parse(text)["eta"]
+        response = await self._post_request(uri, payload)
+        text = await response.text()
+        parsed_data = self._parse_xml(text, uri)
+        data = self._extract_xml_path(parsed_data, ["eta"], uri)
         if "success" in data:
             return True
         if "error" in data:
@@ -835,7 +922,10 @@ class EtaAPI:
         :return: List of active errors
         :rtype: List[ETAError]
         """
-        data = await self._get_request("/user/errors")
-        text = await data.text()
-        data = xmltodict.parse(text)["eta"]["errors"]["fub"]
-        return self._parse_errors(data)
+        response = await self._get_request("/user/errors")
+        text = await response.text()
+        parsed_data = self._parse_xml(text, "/user/errors")
+        error_data = self._extract_xml_path(
+            parsed_data, ["eta", "errors", "fub"], "/user/errors"
+        )
+        return self._parse_errors(error_data)

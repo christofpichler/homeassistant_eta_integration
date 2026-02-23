@@ -1,6 +1,7 @@
 """Common entity definitions for the ETA sensor integration."""
 
 from abc import abstractmethod
+import logging
 from typing import Generic, TypeVar, cast
 
 from homeassistant.components.sensor import SensorEntity
@@ -12,10 +13,12 @@ from homeassistant.helpers.entity import Entity, generate_entity_id
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .api import EtaAPI, ETAEndpoint
+from .const import MAX_CONSECUTIVE_UPDATE_FAILURES
 from .coordinator import ETAErrorUpdateCoordinator, ETAWritableUpdateCoordinator
 from .utils import create_device_info
 
 _EntityT = TypeVar("_EntityT")
+_LOGGER = logging.getLogger(__name__)
 
 
 class EtaEntity(Entity):
@@ -34,10 +37,12 @@ class EtaEntity(Entity):
         self.host = config.get(CONF_HOST, "")
         self.port = config.get(CONF_PORT, "")
         self.uri = endpoint_info["url"]
+        self._consecutive_update_failures = 0
 
         self._attr_device_info = create_device_info(self.host, self.port)
         self.entity_id = generate_entity_id(entity_id_format, unique_id, hass=hass)
         self._attr_unique_id = unique_id
+        self._attr_available = True
 
 
 class EtaSensorEntity(SensorEntity, EtaEntity, Generic[_EntityT]):
@@ -49,7 +54,29 @@ class EtaSensorEntity(SensorEntity, EtaEntity, Generic[_EntityT]):
         This is the only method that should fetch new data for Home Assistant.
         """
         eta_client = EtaAPI(self.session, self.host, self.port)
-        value, _ = await eta_client.get_data(self.uri)
+        try:
+            value, _ = await eta_client.get_data(self.uri)
+        except Exception as err:
+            self._consecutive_update_failures += 1
+            if self._consecutive_update_failures >= MAX_CONSECUTIVE_UPDATE_FAILURES:
+                self._attr_available = False
+                _LOGGER.warning(
+                    "Update failed %s times for entity %s. Marking unavailable: %s",
+                    self._consecutive_update_failures,
+                    self.entity_id,
+                    err,
+                )
+            else:
+                _LOGGER.debug(
+                    "Update failed for entity %s (%s/%s). Keeping previous value.",
+                    self.entity_id,
+                    self._consecutive_update_failures,
+                    MAX_CONSECUTIVE_UPDATE_FAILURES - 1,
+                )
+            return
+
+        self._consecutive_update_failures = 0
+        self._attr_available = True
         self._attr_native_value = cast(_EntityT, value)  # pyright: ignore[reportAttributeAccessIssue]
 
     async def async_update_timeslot_service(self, begin, end, temperature=None) -> None:

@@ -10,7 +10,12 @@ from homeassistant.components.switch import ENTITY_ID_FORMAT, SwitchEntity
 from homeassistant.core import HomeAssistant
 
 from .api import EtaAPI, ETAEndpoint
-from .const import CHOSEN_SWITCHES, DOMAIN, SWITCHES_DICT
+from .const import (
+    CHOSEN_SWITCHES,
+    DOMAIN,
+    MAX_CONSECUTIVE_UPDATE_FAILURES,
+    SWITCHES_DICT,
+)
 from .entity import EtaEntity
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,7 +66,29 @@ class EtaSwitch(EtaEntity, SwitchEntity):
         This is the only method that should fetch new data for Home Assistant.
         """
         eta_client = EtaAPI(self.session, self.host, self.port)
-        value = await eta_client.get_switch_state(self.uri)
+        try:
+            value = await eta_client.get_switch_state(self.uri)
+        except Exception as err:
+            self._consecutive_update_failures += 1
+            if self._consecutive_update_failures >= MAX_CONSECUTIVE_UPDATE_FAILURES:
+                self._attr_available = False
+                _LOGGER.warning(
+                    "Update failed %s times for switch %s. Marking unavailable: %s",
+                    self._consecutive_update_failures,
+                    self.entity_id,
+                    err,
+                )
+            else:
+                _LOGGER.debug(
+                    "Update failed for switch %s (%s/%s). Keeping previous state.",
+                    self.entity_id,
+                    self._consecutive_update_failures,
+                    MAX_CONSECUTIVE_UPDATE_FAILURES - 1,
+                )
+            return
+
+        self._consecutive_update_failures = 0
+        self._attr_available = True
         if value == self.on_value:
             self._attr_is_on = True
         else:

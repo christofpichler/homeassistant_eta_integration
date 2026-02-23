@@ -40,6 +40,7 @@ from .const import (
     DOMAIN,
     ERROR_UPDATE_COORDINATOR,
     FLOAT_DICT,
+    MAX_CONSECUTIVE_UPDATE_FAILURES,
     SUPPORT_WRITE_TIMESLOT,
     SUPPORT_WRITE_TIMESLOT_WITH_TEMPERATURE,
     TEXT_DICT,
@@ -433,7 +434,31 @@ class EtaTimeslotSensor(EtaSensorEntity[str]):
         This is the only method that should fetch new data for Home Assistant.
         """
         eta_client = EtaAPI(self.session, self.host, self.port)
-        value, unit = await eta_client.get_data(self.uri, force_string_handling=True)
+        try:
+            value, unit = await eta_client.get_data(
+                self.uri, force_string_handling=True
+            )
+        except Exception as err:
+            self._consecutive_update_failures += 1
+            if self._consecutive_update_failures >= MAX_CONSECUTIVE_UPDATE_FAILURES:
+                self._attr_available = False
+                _LOGGER.warning(
+                    "Update failed %s times for timeslot sensor %s. Marking unavailable: %s",
+                    self._consecutive_update_failures,
+                    self.entity_id,
+                    err,
+                )
+            else:
+                _LOGGER.debug(
+                    "Update failed for timeslot sensor %s (%s/%s). Keeping previous value.",
+                    self.entity_id,
+                    self._consecutive_update_failures,
+                    MAX_CONSECUTIVE_UPDATE_FAILURES - 1,
+                )
+            return
+
+        self._consecutive_update_failures = 0
+        self._attr_available = True
         start_time, end_time, temperature = self._parse_timeslot_value(str(value))
 
         self._attr_native_value = f"{start_time} - {end_time}{f': {temperature} {unit}' if temperature else ''}"

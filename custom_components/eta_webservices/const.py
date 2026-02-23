@@ -51,6 +51,7 @@ INVISIBLE_UNITS = [
 # Defaults
 DEFAULT_NAME = DOMAIN
 REQUEST_TIMEOUT = 60
+MAX_CONSECUTIVE_UPDATE_FAILURES = 3
 
 STARTUP_MESSAGE = f"""
 -------------------------------------------------------------------
